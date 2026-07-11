@@ -37,9 +37,4 @@ El repo cliente debe incluir su propia carpeta `k8s/` con:
 `watchdog-rbac.yaml` y `watchdog-deployment.yaml` (ver repo `Orders-App`
 como referencia).
 
-## Declaración de uso de IA
-
-Se utilizó Claude (Anthropic) como apoyo para diseñar y documentar esta
-plantilla reutilizable. El código fue revisado y adaptado por el equipo.
-
 ![meow](meow.jpg)
