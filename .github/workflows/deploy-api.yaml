@@ -133,7 +133,7 @@ jobs:
           IP="${{ inputs.k3s-server-public-ip }}"
           SVC="${{ inputs.app-name }}-service"
 
-          CURRENT=$(ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" \
+          CURRENT=$(ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
             "sudo k3s kubectl get service ${SVC} -o jsonpath='{.spec.selector.version}' 2>/dev/null || true")
 
           if [ -z "$CURRENT" ]; then
@@ -169,14 +169,14 @@ jobs:
           set -euo pipefail
           test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
           IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" 'sudo rm -rf /tmp/k8s-deploy'
-          scp -o StrictHostKeyChecking=accept-new -r k8s "ubuntu@${IP}:/tmp/k8s-deploy"
+          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" 'sudo rm -rf /tmp/k8s-deploy'
+          scp -o StrictHostKeyChecking=accept-new -r k8s "ec2-user@${IP}:/tmp/k8s-deploy"
 
       - name: Aplicar recursos base (Services, RBAC, Watchdog, Deployments si no existen)
         run: |
           set -euo pipefail
           IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" '
+          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" '
             set -e
             sudo k3s kubectl apply -f /tmp/k8s-deploy/service.yaml
             sudo k3s kubectl apply -f /tmp/k8s-deploy/watchdog-rbac.yaml
@@ -191,14 +191,14 @@ jobs:
         run: |
           set -euo pipefail
           IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" \
+          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
             "sudo k3s kubectl set image deployment/${{ inputs.app-name }}-${TARGET} ${{ inputs.app-name }}=${IMAGE_FULL} --record"
 
       - name: Esperar rollout del color objetivo
         run: |
           set -euo pipefail
           IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" \
+          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
             "sudo k3s kubectl rollout status deployment/${{ inputs.app-name }}-${TARGET} --timeout=90s"
 
   # ── Etapa 5: Validación de Salud (antes de mover tráfico) ──────────────
@@ -256,13 +256,13 @@ jobs:
         run: |
           set -euo pipefail
           IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" \
+          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
             "sudo k3s kubectl patch service ${{ inputs.app-name }}-service -p '{\"spec\":{\"selector\":{\"app\":\"${{ inputs.app-name }}\",\"version\":\"${TARGET}\"}}}'"
 
       - name: Verificar estado final
         run: |
           IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${IP}" 'sudo k3s kubectl get pods -o wide && sudo k3s kubectl get service ${{ inputs.app-name }}-service -o wide'
+          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" 'sudo k3s kubectl get pods -o wide && sudo k3s kubectl get service ${{ inputs.app-name }}-service -o wide'
 
   # ── Etapa 7: rollback explícito si la salud falló ──────────────────────
   rollback-on-failure:
