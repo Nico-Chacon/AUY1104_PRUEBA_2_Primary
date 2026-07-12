@@ -1,71 +1,46 @@
-name: Plantilla reutilizable - Build, Push y Deploy Blue-Green (TechMarket Orders)
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Esta es la "receta compartida" (EP1). Cualquier microservicio (ej. Orders)
-# la invoca con `uses:` y le pasa sus propios inputs/secrets.
+# Plantilla reutilizable de CI/CD (EP1) - Blue-Green + Validación de Salud + Rollback
 #
-# Estrategia de despliegue: BLUE-GREEN
-#   - Siempre existen 2 Deployments: orders-blue y orders-green.
-#   - Solo uno de los dos recibe tráfico real a través del Service público
-#     "orders-service" (su selector apunta a version=blue o version=green).
-#   - En cada corrida se detecta cuál color está activo, se construye/despliega
-#     la nueva imagen en el color INACTIVO, se valida su salud golpeando su
-#     Service dedicado (sin afectar el tráfico real) y SOLO si pasa la
-#     validación se mueve el Service público al nuevo color.
-#   - Si la validación falla, el Service público nunca se toca -> rollback
-#     automático "gratis" (el tráfico jamás salió de la versión estable).
+# Base tomada y adaptada (con autorización) del proyecto de una compañera de
+# curso, cuyo diseño de pipeline fue probado y validado con éxito en una
+# Prueba de Fuego real (ver README.md para el detalle de la atribución).
+#
+# Resumen del funcionamiento:
+#   - "blue" es la versión estable/base; "green" siempre recibe la versión
+#     candidata en cada despliegue.
+#   - Se valida la salud de green golpeando su Service interno
+#     (demo-api-green-preview) con un pod efímero de curl, ANTES de exponerlo
+#     a tráfico real.
+#   - Si la validación pasa, se mueve el selector del Service público a
+#     "green". Si falla (por cualquier motivo: imagen inexistente, timeout de
+#     rollout, error 500, latencia alta), se hace rollback automático:
+#     el Service público vuelve a "blue" y se ejecuta `rollout undo`.
 # ─────────────────────────────────────────────────────────────────────────────
+
+name: Subir la API a Docker Hub (receta reutilizable)
 
 on:
   workflow_call:
     inputs:
       image-name:
-        description: Nombre de la imagen en Docker Hub (sin el usuario)
         required: true
         type: string
       image-tag:
-        description: Tag de esta versión (ej. tag de git o SHA del commit)
         required: true
         type: string
       k3s-server-public-ip:
-        description: IP pública del servidor K3S (AWS Academy)
         required: true
         type: string
-      app-name:
-        description: Nombre base de la app en K8s (usado como prefijo de recursos)
+      environment:
+        required: true
+        type: string
+      namespace:
+        required: true
+        type: string
+      env_vars:
         required: false
         type: string
-        default: orders
-      container-port:
-        description: Puerto que expone el contenedor de la app
-        required: false
-        type: string
-        default: "80"
-      health-path:
-        description: Ruta HTTP usada para el chequeo de salud
-        required: false
-        type: string
-        default: "/"
-      node-port-public:
-        description: NodePort del Service público (tráfico real de usuarios)
-        required: false
-        type: string
-        default: "30090"
-      node-port-blue:
-        description: NodePort dedicado para golpear SOLO la versión blue (validación)
-        required: false
-        type: string
-        default: "30091"
-      node-port-green:
-        description: NodePort dedicado para golpear SOLO la versión green (validación)
-        required: false
-        type: string
-        default: "30092"
-      max-latency-seconds:
-        description: Latencia máxima aceptada en el chequeo de salud
-        required: false
-        type: string
-        default: "2.0"
+        default: ""
     secrets:
       DOCKER_USERNAME:
         required: true
@@ -74,205 +49,124 @@ on:
       EA2_SSH_PRIVATE_KEY:
         required: true
 
+  workflow_dispatch:
+    inputs:
+      image-name:
+        required: true
+        type: string
+      image-tag:
+        required: true
+        type: string
+      k3s-server-public-ip:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+        default: production
+      namespace:
+        required: true
+        type: string
+        default: default
+      env_vars:
+        required: false
+        type: string
+        default: ""
+
 jobs:
-  # ── Etapa 1: pruebas ────────────────────────────────────────────────────
+
   deps-and-test:
-    name: Dependencias y tests
+    name: Dependencies and Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Instalar dependencias
-        run: npm install
-      - name: Ejecutar tests
-        run: npm test
+      - run: npm install
+      - run: npm test
 
-  # ── Etapa 2: build & push ───────────────────────────────────────────────
   build-and-push:
-    name: Build y push de la imagen Docker
+    name: Build and Push Docker
     needs: deps-and-test
     runs-on: ubuntu-latest
-    outputs:
-      image-full: ${{ steps.vars.outputs.image_full }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Iniciar sesión en Docker Hub
-        uses: docker/login-action@v2
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+      - run: |
+          IMAGE=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}
+          docker build -t $IMAGE:${{ inputs.image-tag }} -t $IMAGE:latest .
+      - run: |
+          IMAGE=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}
+          docker push --all-tags $IMAGE
 
-      - name: Calcular nombre completo de imagen
-        id: vars
-        run: |
-          echo "image_full=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }}" >> "$GITHUB_OUTPUT"
-
-      - name: Construir y publicar imagen
-        run: |
-          IMAGEN="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
-          docker build -t "${IMAGEN}:${{ inputs.image-tag }}" -t "${IMAGEN}:latest" .
-          docker push --all-tags "${IMAGEN}"
-
-  # ── Etapa 3: determinar color activo/inactivo ──────────────────────────
-  determine-color:
-    name: Determinar color activo (blue/green)
+  deploy-to-k8s:
+    name: Deploy to K3S (Blue-Green)
     needs: build-and-push
     runs-on: ubuntu-latest
-    outputs:
-      current-color: ${{ steps.detect.outputs.current }}
-      target-color: ${{ steps.detect.outputs.target }}
+    environment: ${{ inputs.environment }}
     steps:
+
       - uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
 
-      - name: Leer selector actual del Service público
-        id: detect
-        run: |
-          set -euo pipefail
-          IP="${{ inputs.k3s-server-public-ip }}"
-          SVC="${{ inputs.app-name }}-service"
+      - name: Verificar conexión
+        run: ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "echo Conexion correcta"
 
-          CURRENT=$(ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
-            "sudo k3s kubectl get service ${SVC} -o jsonpath='{.spec.selector.version}' 2>/dev/null || true")
-
-          if [ -z "$CURRENT" ]; then
-            echo "No hay color activo previo (primer despliegue). Se asume 'blue' como base."
-            CURRENT="blue"
-          fi
-
-          if [ "$CURRENT" = "blue" ]; then TARGET="green"; else TARGET="blue"; fi
-
-          echo "Color activo actual: $CURRENT"
-          echo "Color objetivo (nueva versión): $TARGET"
-
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "target=$TARGET"   >> "$GITHUB_OUTPUT"
-
-  # ── Etapa 4: desplegar SOLO en el color objetivo ───────────────────────
-  deploy-target-color:
-    name: Desplegar nueva imagen en el color objetivo
-    needs: [build-and-push, determine-color]
-    runs-on: ubuntu-latest
-    env:
-      TARGET: ${{ needs.determine-color.outputs.target-color }}
-      IMAGE_FULL: ${{ needs.build-and-push.outputs.image-full }}
-    steps:
       - uses: actions/checkout@v4
 
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
-
-      - name: Copiar manifiestos k8s/ al servidor
+      - name: Copiar manifiestos
         run: |
-          set -euo pipefail
-          test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
-          IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" 'sudo rm -rf /tmp/k8s-deploy'
-          scp -o StrictHostKeyChecking=accept-new -r k8s "ec2-user@${IP}:/tmp/k8s-deploy"
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "sudo rm -rf /tmp/k8s-deploy"
+          scp -o StrictHostKeyChecking=accept-new -r k8s ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy
 
-      - name: Aplicar recursos base (Services, RBAC, Watchdog, Deployments si no existen)
+      - name: Crear Namespace
         run: |
-          set -euo pipefail
-          IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" '
-            set -e
-            sudo k3s kubectl apply -f /tmp/k8s-deploy/service.yaml
-            sudo k3s kubectl apply -f /tmp/k8s-deploy/watchdog-rbac.yaml
-            sudo k3s kubectl apply -f /tmp/k8s-deploy/watchdog-deployment.yaml
-            # Los Deployments blue/green solo se crean si aun no existen,
-            # para no pisar la imagen que ya está corriendo en el color activo.
-            sudo k3s kubectl get deployment '"${{ inputs.app-name }}"'-blue  >/dev/null 2>&1 || sudo k3s kubectl apply -f /tmp/k8s-deploy/deployment-blue.yaml
-            sudo k3s kubectl get deployment '"${{ inputs.app-name }}"'-green >/dev/null 2>&1 || sudo k3s kubectl apply -f /tmp/k8s-deploy/deployment-green.yaml
-          '
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl create namespace ${{ inputs.namespace }} --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
 
-      - name: Actualizar imagen SOLO en el color objetivo ($TARGET)
+      - name: Aplicar manifiestos base
         run: |
-          set -euo pipefail
-          IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
-            "sudo k3s kubectl set image deployment/${{ inputs.app-name }}-${TARGET} ${{ inputs.app-name }}=${IMAGE_FULL} --record"
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl apply -n ${{ inputs.namespace }} -f /tmp/k8s-deploy"
 
-      - name: Esperar rollout del color objetivo
+      - name: Actualizar imagen solo en green
         run: |
-          set -euo pipefail
-          IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
-            "sudo k3s kubectl rollout status deployment/${{ inputs.app-name }}-${TARGET} --timeout=90s"
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl set image deployment/demo-api-green demo-api=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }} -n ${{ inputs.namespace }}"
 
-  # ── Etapa 5: Validación de Salud (antes de mover tráfico) ──────────────
-  health-check:
-    name: "Validación de Salud del color objetivo"
-    needs: [determine-color, deploy-target-color]
-    runs-on: ubuntu-latest
-    env:
-      TARGET: ${{ needs.determine-color.outputs.target-color }}
-    steps:
-      - name: Golpear el Service dedicado del color objetivo (5 intentos)
+      - name: Inyectar variables de entorno en green
+        if: inputs.env_vars != ''
         run: |
-          set -uo pipefail
-          IP="${{ inputs.k3s-server-public-ip }}"
-          if [ "$TARGET" = "blue" ]; then PORT="${{ inputs.node-port-blue }}"; else PORT="${{ inputs.node-port-green }}"; fi
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl set env deployment/demo-api-green ${{ inputs.env_vars }} -n ${{ inputs.namespace }}"
 
-          FAILS=0
-          for i in 1 2 3 4 5; do
-            STATUS=$(curl -o /dev/null -s -w "%{http_code}" --max-time 3 "http://${IP}:${PORT}${{ inputs.health-path }}" || echo "000")
-            LATENCY=$(curl -o /dev/null -s -w "%{time_total}" --max-time 3 "http://${IP}:${PORT}${{ inputs.health-path }}" || echo "999")
-            echo "Intento $i -> status=$STATUS latencia=${LATENCY}s"
-
-            if [ "$STATUS" != "200" ]; then
-              echo "::warning::Respuesta no saludable (status=$STATUS) en intento $i"
-              FAILS=$((FAILS+1))
-            fi
-
-            AWK_OK=$(awk -v l="$LATENCY" -v m="${{ inputs.max-latency-seconds }}" 'BEGIN{print (l>m)?1:0}')
-            if [ "$AWK_OK" = "1" ]; then
-              echo "::warning::Latencia alta (${LATENCY}s > ${{ inputs.max-latency-seconds }}s) en intento $i"
-              FAILS=$((FAILS+1))
-            fi
-            sleep 2
-          done
-
-          if [ "$FAILS" -gt 0 ]; then
-            echo "::error::Validación de salud FALLÓ ($FAILS problemas detectados). No se moverá el tráfico."
-            exit 1
-          fi
-          echo "Validación de salud OK. Listo para mover el tráfico al 100%."
-
-  # ── Etapa 6: mover tráfico al 100% (solo si la salud fue OK) ───────────
-  switch-traffic:
-    name: Mover tráfico público al color objetivo
-    needs: [determine-color, health-check]
-    runs-on: ubuntu-latest
-    env:
-      TARGET: ${{ needs.determine-color.outputs.target-color }}
-    steps:
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
-
-      - name: Patch del Service público -> nuevo color
+      - name: Esperar Rollout de green
         run: |
-          set -euo pipefail
-          IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" \
-            "sudo k3s kubectl patch service ${{ inputs.app-name }}-service -p '{\"spec\":{\"selector\":{\"app\":\"${{ inputs.app-name }}\",\"version\":\"${TARGET}\"}}}'"
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl rollout status deployment/demo-api-green -n ${{ inputs.namespace }} --timeout=120s"
 
-      - name: Verificar estado final
+      - name: Validación de Salud
         run: |
-          IP="${{ inputs.k3s-server-public-ip }}"
-          ssh -o StrictHostKeyChecking=accept-new "ec2-user@${IP}" 'sudo k3s kubectl get pods -o wide && sudo k3s kubectl get service ${{ inputs.app-name }}-service -o wide'
+         RESULT=$(ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl run healthcheck-tmp-\$RANDOM --rm -i --restart=Never --image=curlimages/curl -n ${{ inputs.namespace }} -- curl -s -o /dev/null -w '%{http_code} %{time_total}' http://demo-api-green-preview:3000/health || echo '000 0'")
+          echo "Resultado: $RESULT"
+          CODE=$(echo "$RESULT" | tail -1 | awk '{print $1}')
+          TIME=$(echo "$RESULT" | tail -1 | awk '{print $2}')
+          echo "Codigo: $CODE - Tiempo: $TIME"
+          if [ "$CODE" != "200" ]; then echo "FALLA: codigo HTTP $CODE"; exit 1; fi
+          if (( $(echo "$TIME > 2.0" | bc -l) )); then echo "FALLA: latencia alta ($TIME s)"; exit 1; fi
+          echo "Salud OK"
 
-  # ── Etapa 7: rollback explícito si la salud falló ──────────────────────
-  rollback-on-failure:
-    name: "Rollback automático (no se movió tráfico)"
-    needs: [determine-color, health-check]
-    if: failure()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Registrar rollback
+      - name: Cambiar tráfico a green
+        if: success()
         run: |
-          echo "::error::La validación de salud del color '${{ needs.determine-color.outputs.target-color }}' falló."
-          echo "El Service público NUNCA se movió de '${{ needs.determine-color.outputs.current-color }}'."
-          echo "Rollback automático completo: los usuarios siguieron recibiendo la versión estable en todo momento."
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl patch svc demo-api-service -n ${{ inputs.namespace }} -p '{\"spec\":{\"selector\":{\"app\":\"demo-api\",\"version\":\"green\"}}}'"
+
+      - name: Rollback automático
+        if: failure()
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+          "sudo k3s kubectl patch svc demo-api-service -n ${{ inputs.namespace }} -p '{\"spec\":{\"selector\":{\"app\":\"demo-api\",\"version\":\"blue\"}}}' ; sudo k3s kubectl rollout undo deployment/demo-api-green -n ${{ inputs.namespace }}"
