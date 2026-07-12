@@ -53,3 +53,4 @@ jobs:
       EA2_SSH_PRIVATE_KEY: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      K3S_SERVER_PUBLIC_IP: ${{ secrets.K3S_SERVER_PUBLIC_IP }}
